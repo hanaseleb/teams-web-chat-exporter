@@ -12,6 +12,7 @@ export type StartExportRequest = {
     tabId?: number | null;
     scrapeOptions: ScrapeOptions;
     buildOptions: BuildOptions;
+    ingestProjectName?: string;
   };
 };
 export type StartExportResponse = {
@@ -22,6 +23,10 @@ export type StartExportResponse = {
   cancelled?: boolean;
   error?: string;
   code?: string;
+  errorCode?: string;
+  errorDetail?: string;
+  errorStatus?: number;
+  sent?: boolean;
 };
 
 // Multi-chat bundle export. The popup sends this when the picker has 2+
@@ -37,6 +42,7 @@ export type StartBundleExportRequest = {
     conversations: Array<{ id: string; title: string }>;
     scrapeOptions: ScrapeOptions;
     buildOptions: BuildOptions;
+    ingestProjectName?: string;
   };
 };
 export type StartBundleExportResponse = {
@@ -49,6 +55,10 @@ export type StartBundleExportResponse = {
   cancelled?: boolean;
   error?: string;
   code?: string;
+  errorCode?: string;
+  errorDetail?: string;
+  errorStatus?: number;
+  sent?: boolean;
 };
 
 // Low-level "I have a payload, write a file" entry. Single-format only —

@@ -6,6 +6,7 @@
   } from 'lucide-svelte';
   import { t } from '../../../i18n/i18n';
   import { getReviewStoreUrl } from '../../../utils/store-urls';
+  import EbiIngestSettings from './EbiIngestSettings.svelte';
 
   // Repo + issues + author URLs used by the About card. Hard-coded
   // strings (vs. reading from the manifest) because they never change
@@ -684,6 +685,8 @@
     <!-- Help & feedback: replay (in-app, chevron) + external links (↗).
          External links open in a new tab so the popup doesn't close under
          the user; rel=noopener keeps window.opener null. -->
+    <EbiIngestSettings lang={lang} />
+
     <section class="ac">
       <div class="ah"><LifeBuoy size={14} /> {t('settings.grp.help', {}, lang)}</div>
       <div class="group">

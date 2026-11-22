@@ -75,6 +75,8 @@
   import OnboardingOverlay from "./components/OnboardingOverlay.svelte";
   import ReviewPrompt from "./components/ReviewPrompt.svelte";
   import ConversationPicker from "./components/ConversationPicker.svelte";
+  import EbiIngestSection from "./components/EbiIngestSection.svelte";
+  import { loadRecentProjectNames, rememberRecentProjectName } from "../../utils/ebi-ingest";
   import { t, setLanguage, getLanguage } from "../../i18n/i18n";
 
   const runtime =
@@ -563,6 +565,8 @@
   // the History page (which marks them all as seen).
   let historyEntries: HistoryEntry[] = [];
   let savedPresets: SavedPreset[] = [];
+  let ebiProjectName = '';
+  let recentProjectNames: string[] = [];
 
   // Saved selection presets: loaded on mount; mutated via the picker's Presets
   // menu. Internal identifiers and the storage key keep the legacy "group"
@@ -605,6 +609,26 @@
   let options: Options = { ...DEFAULT_OPTIONS };
   const currentLang = () => options.lang || "en";
   const emptyLabel = () => t("status.empty", {}, currentLang());
+  const ingestErrorKeys: Record<string, string> = {
+    settings: 'ebi.error.settings',
+    project: 'ebi.error.project',
+    size: 'ebi.error.size',
+    network: 'ebi.error.network',
+    permission: 'ebi.error.permission',
+    disabled: 'ebi.error.disabled',
+    unauthorized: 'ebi.error.unauthorized',
+    conflict: 'ebi.error.conflict',
+    http: 'ebi.error.http',
+  };
+  function responseErrorMessage(response: { error?: string; errorCode?: string; errorDetail?: string; errorStatus?: number }) {
+    const key = response.errorCode ? ingestErrorKeys[response.errorCode] : undefined;
+    if (!key) return response.error || t('status.error', {}, currentLang());
+    const localized = (response.errorStatus === undefined
+      ? t(key, {}, currentLang())
+      : t(key, { status: response.errorStatus }, currentLang()))
+      || response.error || t('status.error', {}, currentLang());
+    return response.errorDetail ? `${localized} ${response.errorDetail}` : localized;
+  }
 
   let quickRanges: QuickRange[] = [
     { key: "none", label: t("quick.none", {}, currentLang()), icon: "∞" },
@@ -1243,7 +1267,7 @@
     }
   };
 
-  const startExport = async () => {
+  const startExport = async (ingestProjectName?: string) => {
     if (busy || !alive) return;
     // Pre-flight: refuse to start when the browser tells us we're
     // offline. navigator.onLine === false is high-confidence — browsers
@@ -1295,6 +1319,7 @@
         const bundleData = {
           tabId: tab.id,
           conversations: conversationsPayload,
+          ...(ingestProjectName !== undefined ? { ingestProjectName } : {}),
           scrapeOptions: {
             startAt: range.startISO,
             endAt: range.endISO,
@@ -1350,16 +1375,19 @@
           return;
         }
         if (!bundleResp || bundleResp.error) {
-          throw new Error(
-            bundleResp?.error || t("status.error", {}, currentLang()),
-          );
+          throw new Error(bundleResp ? responseErrorMessage(bundleResp) : t("status.error", {}, currentLang()));
+        }
+        if (bundleResp.sent && ingestProjectName !== undefined) {
+          recentProjectNames = await rememberRecentProjectName(storage.local, ingestProjectName);
         }
         const langNow2 = currentLang();
         const success = bundleResp.successChats ?? 0;
         const total = bundleResp.totalChats ?? success;
         const failed = bundleResp.failedChats ?? 0;
         const summaryKey = failed > 0 ? 'status.bundleCompleteWithFailures' : 'status.bundleComplete';
-        const summaryText = t(summaryKey, { success, total, failed }, langNow2)
+        const summaryText = bundleResp.sent
+          ? t('ebi.sent', {}, langNow2)
+          : t(summaryKey, { success, total, failed }, langNow2)
           || `Bundle export complete: ${success} of ${total} chats${failed ? ` (${failed} failed)` : ''}.`;
         setStatus(
           bundleResp.filename
@@ -1374,6 +1402,7 @@
 
       const requestData = {
         tabId: tab.id,
+        ...(ingestProjectName !== undefined ? { ingestProjectName } : {}),
         scrapeOptions: {
           startAt: range.startISO,
           endAt: range.endISO,
@@ -1449,17 +1478,18 @@
         return;
       }
       if (!response || response.error) {
-        throw new Error(
-          response?.error || t("status.error", {}, currentLang()),
-        );
+        throw new Error(response ? responseErrorMessage(response) : t("status.error", {}, currentLang()));
       }
       const langNow = currentLang();
+      if (response.sent && ingestProjectName !== undefined) {
+        recentProjectNames = await rememberRecentProjectName(storage.local, ingestProjectName);
+      }
       setStatus(
         response.filename
           // Leaf only: in package mode (Files on) the filename is a
           // Downloads-relative path ('folder/file.zip').
-          ? `${t("status.complete", {}, langNow)} (${response.filename.split("/").pop()})`
-          : t("status.complete", {}, langNow),
+          ? `${response.sent ? t('ebi.sent', {}, langNow) : t("status.complete", {}, langNow)} (${response.filename.split("/").pop()})`
+          : response.sent ? t('ebi.sent', {}, langNow) : t("status.complete", {}, langNow),
       );
       hideErrorBanner(true);
     } catch (e: any) {
@@ -1475,6 +1505,17 @@
     } finally {
       setBusy(false);
     }
+  };
+
+  const startEbiIngest = () => {
+    const name = ebiProjectName.trim();
+    if (!name) {
+      const message = t('ebi.error.project', {}, currentLang());
+      setStatus(message);
+      showErrorBanner(message);
+      return;
+    }
+    void startExport(name);
   };
 
   // Handlers passed down to HistoryPage. They mutate storage and re-read it
@@ -1542,6 +1583,9 @@
       options = loaded;
       __popupTrace('options-loaded');
       void refreshSavedPresets();
+      void loadRecentProjectNames(storage.local).then((names) => {
+        if (alive) recentProjectNames = names;
+      });
       // Reconcile imageFetchFallback with the live <all_urls>
       // permission state on every popup open. Both Firefox and Chrome
       // can close the popup mid-await on focus-loss when the permission
@@ -1891,8 +1935,17 @@
         {segments}
         flashTrigger={successFlashTrigger}
         lang={options.lang || "en"}
-        on:run={startExport}
+        on:run={() => startExport()}
         on:stop={stopExport}
+      />
+
+      <EbiIngestSection
+        bind:projectName={ebiProjectName}
+        {recentProjectNames}
+        disabled={selectedConversationIds.length === 0}
+        {busy}
+        lang={options.lang || "en"}
+        on:send={startEbiIngest}
       />
 
       {#if reviewPromptEligible}
