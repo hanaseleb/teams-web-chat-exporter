@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { defineConfig } from 'wxt';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { TEAMS_MATCH_PATTERNS, API_FETCH_PATTERNS } from './src/utils/teams-urls';
+import { SLACK_MATCH_PATTERNS } from './src/utils/slack-urls';
 
 // A per-build identifier baked into the bundle so any export, log line or
 // diagnostic can be traced to the exact build that produced it (kills the
@@ -126,7 +127,7 @@ export default defineConfig({
       // needing this permission.
       ...(manifestVersion === 3 ? ['offscreen' as const] : []),
     ],
-    host_permissions: [...TEAMS_MATCH_PATTERNS, ...API_FETCH_PATTERNS],
+    host_permissions: [...TEAMS_MATCH_PATTERNS, ...API_FETCH_PATTERNS, ...SLACK_MATCH_PATTERNS, 'https://slack.com/api/*', 'https://files.slack.com/*'],
     // page-helpers/urlp-fetcher.js runs in the Teams page's MAIN world
     // so it can use the page's cookie partition for fetches against
     // the asyncgw URL-image proxy. Content script injects it via a

@@ -1,6 +1,7 @@
 import { defineBackground } from 'wxt/sandbox';
 import { createBadgeManager } from '../utils/badge';
 import { isTeamsUrl, isMicrosoftApiHost } from '../utils/teams-urls';
+import { isSlackUrl } from '../utils/slack-urls';
 import {
   buildAndDownload,
   buildAndDownloadBundle,
@@ -35,9 +36,10 @@ import {
   loadIngestSettings,
   sendToEbiIngest,
   type EbiIngestSettings,
+  type IngestAttachmentManifestEntry,
 } from '../utils/ebi-ingest';
 import { ACTIVE_EXPORTS_STORAGE_KEY, FIRST_INSTALL_STORAGE_KEY, appendHistoryEntry, clampConcurrency, ATTACH_CONCURRENCY_DEFAULT } from '../utils/options';
-import type { BackgroundIncomingMessage } from '../types/messaging';
+import type { BackgroundIncomingMessage, StartSlackExportRequest, StartSlackExportResponse } from '../types/messaging';
 import type {
   ActiveExportInfo,
   BuildOptions,
@@ -451,7 +453,7 @@ runtime.onStartup?.addListener(() => {
 
 tabs.onUpdated.addListener((tabId: number, changeInfo: chrome.tabs.TabChangeInfo, tab?: chrome.tabs.Tab) => {
     const nextUrl = changeInfo.url ?? tab?.url;
-    if (changeInfo.status === 'loading' && isTeamsUrl(nextUrl)) {
+    if (changeInfo.status === 'loading' && (isTeamsUrl(nextUrl) || isSlackUrl(nextUrl))) {
         activeExports.delete(tabId); void persistActiveExports();
         resetBadge();
     }
@@ -1937,6 +1939,7 @@ const cancelledTabs = new Set<number>();
 // the next iteration. STOP_EXPORT writes to this set as well as aborting
 // the in-flight scrape; the bundle loop checks it between chats.
 const bundleStops = new Set<number>();
+const slackExportTabs = new Set<number>();
 
 function trackFetch(tabId: number | undefined, controller: AbortController) {
     if (tabId == null) return;
@@ -2159,6 +2162,294 @@ async function handleFetchBlobDirectMessage(
 }
 
 resetBadge();
+
+async function assertSlackTab(tabId: number): Promise<void> {
+    const tab = await tabs.get(tabId);
+    if (!isSlackUrl(tab?.url)) throw new Error('Open Slack Web in the selected tab and retry.');
+}
+
+function handleStartSlackExportMessage(
+    request: StartSlackExportRequest,
+    sendResponse: (response: StartSlackExportResponse) => void,
+): void {
+    const { tabId, conversations: requested, scrapeOptions = {}, buildOptions = {} } = request.data || {};
+    const conversations = Array.isArray(requested)
+        ? requested.filter((item): item is { id: string; title: string } =>
+            !!item && typeof item.id === 'string' && typeof item.title === 'string')
+        : [];
+    const ingestRequested = request.data?.ingestProjectName !== undefined;
+    const projectName = typeof request.data?.ingestProjectName === 'string' ? request.data.ingestProjectName.trim() : '';
+    if (typeof tabId !== 'number') { sendResponse({ error: 'Missing Slack tab id.' }); return; }
+    if (!conversations.length) { sendResponse({ error: 'Select at least one Slack conversation.' }); return; }
+    if (ingestRequested && !projectName) { sendResponse({ error: 'Enter an Ebi Workspace project name first.', errorCode: 'project' }); return; }
+    const current = activeExports.get(tabId);
+    if (current?.phase && !TERMINAL_PHASES.has(current.phase)) {
+        sendResponse({ error: 'An export is already running for this tab.' });
+        return;
+    }
+
+    const validFormats = ['json', 'csv', 'html', 'txt', 'pdf'] as const;
+    const formats = (Array.isArray(buildOptions.formats) ? buildOptions.formats : [])
+        .filter((format): format is typeof validFormats[number] =>
+            typeof format === 'string' && (validFormats as readonly string[]).includes(format));
+    if (!formats.length) formats.push('json');
+    const failures: BundleFailure[] = [];
+    const names: string[] = [];
+    const attachmentManifest: IngestAttachmentManifestEntry[] = [];
+    const workspaceFolders = new Set<string>();
+    const workspaceFolderById = new Map<string, string>();
+    const conversationFolders = new Map<string, Set<string>>();
+    let bundleZip: ZipStream | null = null;
+    let entryCount = 0;
+    let messageCount = 0;
+
+    bundleStops.delete(tabId);
+    slackExportTabs.add(tabId);
+    void (async () => {
+        const startedAt = Date.now();
+        let ingestSettings: EbiIngestSettings | undefined;
+        let outcome = 'error';
+        let filename: string | undefined;
+        try {
+            await assertSlackTab(tabId);
+            if (ingestRequested) ingestSettings = await requireIngestSettings();
+            beginExportStats(tabId, conversations.length > 1 ? 'bundle' : 'single', startedAt);
+            updateActiveExport(tabId, { startedAt, phase: 'starting', lastStatus: undefined });
+            await persistActiveExports();
+            broadcastStatus({ tabId, phase: 'starting', startedAt });
+
+            const onBuiltFile: BuildDownloadDeps['onBuiltFile'] = ingestSettings
+                ? async (blob, outputName, mime) => {
+                    await sendToEbiIngest(
+                        ingestSettings!,
+                        { blob, filename: outputName, mime },
+                        projectName,
+                        names,
+                        undefined,
+                        'slack',
+                        attachmentManifest,
+                    );
+                }
+            : undefined;
+
+            for (let index = 0; index < conversations.length; index++) {
+                if (bundleStops.has(tabId)) break;
+                const selected = conversations[index];
+                broadcastStatus({
+                    tabId,
+                    phase: 'scrape:start',
+                    bundleCurrentChat: index + 1,
+                    bundleTotalChats: conversations.length,
+                });
+                getExportStats(tabId)?.beginChat(Date.now());
+                const scrapeStartedAt = Date.now();
+                try {
+                    const response = await sendMessageToTab(tabId, {
+                        type: 'SLACK_EXPORT_CONVERSATION',
+                        id: selected.id,
+                        options: {
+                            startAt: scrapeOptions.startAt,
+                            endAt: scrapeOptions.endAt,
+                            includeReplies: scrapeOptions.includeReplies,
+                            downloadFiles: Boolean(buildOptions.downloadFiles),
+                            attachmentSizeCapMb: buildOptions.attachmentSizeCapMb,
+                        },
+                    });
+                    if (!response?.ok || !response.result || typeof response.result !== 'object') {
+                        throw new Error(typeof response?.error === 'string' ? response.error : 'Slack conversation could not be read.');
+                    }
+                    const data = response.result as {
+                        workspaceName?: unknown;
+                        conversationName?: unknown;
+                        messages?: unknown;
+                        attachmentsManifest?: unknown;
+                    };
+                    const workspaceName = typeof data.workspaceName === 'string' && data.workspaceName ? data.workspaceName : 'Workspace';
+                    const conversationName = typeof data.conversationName === 'string' && data.conversationName ? data.conversationName : selected.title;
+                    const workspaceId = selected.id.match(/^slack(?:-thread)?:([^:]+):/)?.[1] || workspaceName;
+                    let workspaceFolder = workspaceFolderById.get(workspaceId);
+                    if (!workspaceFolder) {
+                        workspaceFolder = pickBundleFolderName(workspaceName, workspaceFolders);
+                        workspaceFolderById.set(workspaceId, workspaceFolder);
+                    }
+                    let usedNames = conversationFolders.get(workspaceFolder);
+                    if (!usedNames) { usedNames = new Set<string>(); conversationFolders.set(workspaceFolder, usedNames); }
+                    const conversationFolder = pickBundleFolderName(conversationName, usedNames);
+                    const exportFolder = `${workspaceFolder}/${conversationFolder}`;
+                    const messages = Array.isArray(data.messages) ? data.messages as ExportMessage[] : [];
+                    messageCount += messages.length;
+                    getExportStats(tabId)?.addChat({
+                        title: `${workspaceName}/${conversationName}`,
+                        convId: selected.id,
+                        messages: messages.length,
+                        scrapeMs: Math.max(0, Date.now() - scrapeStartedAt),
+                    }, Date.now());
+                    if (!messages.length) {
+                        failures.push({ folderName: exportFolder, conversationId: selected.id, reason: 'No messages in the selected date range.' });
+                        continue;
+                    }
+                    if (Array.isArray(data.attachmentsManifest)) {
+                        for (const item of data.attachmentsManifest) {
+                            if (!item || typeof item !== 'object') continue;
+                            const entry = item as { name?: unknown; status?: unknown };
+                            if (typeof entry.name !== 'string' || !['embedded', 'linked', 'failed'].includes(String(entry.status))) continue;
+                            attachmentManifest.push({
+                                name: `${exportFolder}/attachments/${entry.name.split('/').pop() || 'attachment'}`,
+                                status: entry.status as IngestAttachmentManifestEntry['status'],
+                            });
+                        }
+                    }
+                    const built = await buildOneChatForBundle({
+                        messages,
+                        meta: {
+                            title: `Slack_${workspaceName}_${conversationName}`,
+                            conversationId: selected.id,
+                            startAt: scrapeOptions.startAt || null,
+                            endAt: scrapeOptions.endAt || null,
+                        },
+                        formats,
+                        embedAvatars: Boolean(buildOptions.embedAvatars),
+                        downloadImages: Boolean(buildOptions.downloadImages),
+                        imageFilenameDate: Boolean(buildOptions.imageFilenameDate),
+                        imageModifiedDate: Boolean(buildOptions.imageModifiedDate),
+                        avatarMode: buildOptions.avatarMode === 'files' ? 'files' : 'inline',
+                        pdfPageSize: buildOptions.pdfPageSize,
+                        pdfBodyFontSize: buildOptions.pdfBodyFontSize,
+                        pdfShowPageNumbers: buildOptions.pdfShowPageNumbers,
+                        pdfIncludeAvatars: buildOptions.pdfIncludeAvatars,
+                        onPdfProgress: (done, total) => broadcastStatus({
+                            tabId,
+                            phase: 'build',
+                            messagesBuilt: done,
+                            messagesTotal: total,
+                            bundleCurrentChat: index + 1,
+                            bundleTotalChats: conversations.length,
+                        }),
+                    });
+                    if (!built.files.length) {
+                        failures.push({ folderName: exportFolder, conversationId: selected.id, reason: 'No export format could be built.' });
+                    } else {
+                        bundleZip = bundleZip || createZipStream('slack-export');
+                        for (const file of built.files) await bundleZip.add(`${exportFolder}/${file.relativePath}`, file.data, file.mtime);
+                        entryCount++;
+                        names.push(`${workspaceFolder}/${conversationFolder}`);
+                    }
+                    for (const formatFailure of built.formatFailures) {
+                        failures.push({ folderName: exportFolder, conversationId: selected.id, reason: formatFailure.error });
+                    }
+                    broadcastStatus({
+                        tabId,
+                        phase: 'scrape:complete',
+                        messages: messages.length,
+                        bundleCurrentChat: index + 1,
+                        bundleTotalChats: conversations.length,
+                    });
+                } catch (error) {
+                    if (bundleStops.has(tabId)) break;
+                    const reason = error instanceof Error && /^Slack [a-z.]+ failed \([a-z0-9_-]+\)\.$/i.test(error.message)
+                        ? error.message
+                        : 'Slack conversation could not be exported.';
+                    failures.push({ folderName: selected.title, conversationId: selected.id, reason });
+                }
+            }
+
+            if (bundleStops.has(tabId)) {
+                bundleStops.delete(tabId);
+                outcome = 'cancelled';
+                broadcastStatus({ tabId, phase: 'cancelled' });
+                sendResponse({ cancelled: true });
+                return;
+            }
+            if (entryCount === 0 || !bundleZip) {
+                outcome = 'empty';
+                const error = failures[0]?.reason || 'No Slack messages found for the selected conversations.';
+                broadcastStatus({ tabId, phase: 'empty', error, bundleTotalChats: conversations.length, bundleSuccessCount: 0, bundleFailedCount: failures.length });
+                sendResponse({ error, code: 'EMPTY_RESULTS' });
+                return;
+            }
+
+            const result = await buildAndDownloadBundlesZip(
+                {
+                    downloads,
+                    isFirefox,
+                    onBuiltFile,
+                    onStatus: payload => broadcastStatus({ tabId, ...payload }),
+                    onArtifact: artifact => getExportStats(tabId)?.addFormat(artifact.format, artifact.bytes),
+                },
+                bundleZip,
+                entryCount,
+                failures,
+                [],
+                [],
+                { filenamePrefix: 'SlackExport' },
+            ) as { filename?: string; id?: number; sent?: boolean };
+            filename = result.filename;
+            if (result.id != null) {
+                const downloadStatus = await waitForDownloadComplete(result.id, 60_000);
+                if (downloadStatus === 'interrupted') {
+                    outcome = 'cancelled';
+                    broadcastStatus({ tabId, phase: 'cancelled' });
+                    sendResponse({ cancelled: true });
+                    return;
+                }
+            }
+            outcome = failures.length ? 'partial' : 'success';
+            const downloadId = result.id;
+            broadcastStatus({
+                tabId,
+                phase: 'complete',
+                filename,
+                downloadId,
+                bundleTotalChats: conversations.length,
+                bundleSuccessCount: entryCount,
+                bundleFailedCount: failures.length,
+            });
+            await persistHistoryEntry({
+                id: makeEntryId(),
+                tabId,
+                kind: failures.length ? 'partial' : 'success',
+                downloadId,
+                filename,
+                title: `${entryCount} Slack conversation${entryCount === 1 ? '' : 's'}`,
+                isZip: true,
+                elapsedMs: Math.max(0, Date.now() - startedAt),
+                savedAt: Date.now(),
+            });
+            if (downloadId != null && buildOptions.afterExport === 'show') {
+                try { await downloads.show(downloadId); } catch { /* best-effort */ }
+            }
+            sendResponse({
+                ok: true,
+                filename,
+                downloadId,
+                totalChats: conversations.length,
+                successChats: entryCount,
+                failedChats: failures.length,
+                messages: messageCount,
+                sent: Boolean(result.sent),
+            });
+        } catch (error) {
+            if (bundleStops.has(tabId)) {
+                bundleStops.delete(tabId);
+                outcome = 'cancelled';
+                broadcastStatus({ tabId, phase: 'cancelled' });
+                sendResponse({ cancelled: true });
+            } else {
+                const message = error instanceof Error ? error.message : 'Slack export failed.';
+                outcome = 'error';
+                broadcastStatus({ tabId, phase: 'error', error: message });
+                sendResponse({ error: message, ...ingestErrorFields(error) });
+            }
+        } finally {
+            slackExportTabs.delete(tabId);
+            bundleStops.delete(tabId);
+            getExportStats(tabId)?.log(Date.now(), outcome, { filename, messages: messageCount, buildStamp: BUILD_STAMP });
+            endExportStats(tabId);
+            activeExports.delete(tabId);
+            void persistActiveExports();
+        }
+    })();
+}
 
 runtime.onMessage.addListener((msg: BackgroundIncomingMessage, sender, sendResponse) => {
     if (!msg || !msg.type) return;
@@ -2442,6 +2733,11 @@ runtime.onMessage.addListener((msg: BackgroundIncomingMessage, sender, sendRespo
         return true;
     }
 
+    if (msg.type === 'START_SLACK_EXPORT') {
+        handleStartSlackExportMessage(msg, sendResponse);
+        return true;
+    }
+
     if (msg.type === 'EXPORT_STATUS_UPDATE') {
         const payload = msg.payload || {};
         broadcastStatus(payload);
@@ -2558,6 +2854,43 @@ runtime.onMessage.addListener((msg: BackgroundIncomingMessage, sender, sendRespo
         })();
         return true; // async response
     }
+
+    if (msg.type === 'SLACK_LIST_CONVERSATIONS') {
+        const tabId = typeof msg.tabId === 'number' ? msg.tabId : sender?.tab?.id;
+        if (typeof tabId !== 'number') {
+            sendResponse({ ok: false, error: 'Missing Slack tab id.' });
+            return;
+        }
+        (async () => {
+            try {
+                await assertSlackTab(tabId);
+                const response = await sendMessageToTab(tabId, { type: 'SLACK_LIST_CONVERSATIONS' });
+                sendResponse(response ?? { ok: false, error: 'Slack Web did not respond.' });
+            } catch (error) {
+                sendResponse({ ok: false, error: error instanceof Error ? error.message : 'Slack request failed.' });
+            }
+        })();
+        return true;
+    }
+
+    if (msg.type === 'SLACK_LIST_THREADS') {
+        const tabId = typeof msg.tabId === 'number' ? msg.tabId : sender?.tab?.id;
+        const conversationId = typeof msg.conversationId === 'string' ? msg.conversationId : '';
+        if (typeof tabId !== 'number' || !conversationId) {
+            sendResponse({ ok: false, error: 'Select a Slack conversation and try again.' });
+            return;
+        }
+        (async () => {
+            try {
+                await assertSlackTab(tabId);
+                const response = await sendMessageToTab(tabId, { type: 'SLACK_LIST_THREADS', conversationId });
+                sendResponse(response ?? { ok: false, error: 'Slack Web did not respond.' });
+            } catch (error) {
+                sendResponse({ ok: false, error: error instanceof Error ? error.message : 'Slack request failed.' });
+            }
+        })();
+        return true;
+    }
 });
 
 async function handleStopExportMessage(tabId: number, sendResponse: (resp: unknown) => void) {
@@ -2610,7 +2943,9 @@ async function handleStopExportMessage(tabId: number, sendResponse: (resp: unkno
     // Forward to the content script so it aborts its IC3 pagination loop
     // (or whichever phase it's in) and discards collected data.
     try {
-        await sendMessageToTab(tabId, { type: 'STOP_SCRAPE' });
+        await sendMessageToTab(tabId, slackExportTabs.has(tabId)
+            ? { type: 'SLACK_CANCEL' }
+            : { type: 'STOP_SCRAPE' });
     } catch (e) {
         log('failed to forward STOP_SCRAPE:', e);
     }

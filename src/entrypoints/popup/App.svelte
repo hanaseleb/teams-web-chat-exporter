@@ -46,6 +46,7 @@
   } from "../../utils/time";
   import { runtimeSend } from "../../utils/messaging";
   import { isTeamsUrl } from "../../utils/teams-urls";
+  import { isSlackUrl } from "../../utils/slack-urls";
   import { conversationDisplayName } from "../../utils/conversation-labels";
   import type {
     GetExportStatusRequest,
@@ -54,6 +55,10 @@
     StartExportResponse,
     StartBundleExportRequest,
     StartBundleExportResponse,
+    StartSlackExportRequest,
+    StartSlackExportResponse,
+    SlackListThreadsRequest,
+    SlackListThreadsResponse,
     StopExportRequest,
   } from "../../types/messaging";
   import type { ConversationKind, ConversationSummary, ExportStatusPayload, FolderSummary, HistoryEntry, SavedPreset } from "../../types/shared";
@@ -215,6 +220,10 @@
   // silently falling back to auto-detect — explicit failure modes beat
   // confusing "it exported the wrong chat" behaviour.
   let conversations: ConversationSummary[] = [];
+  let currentSource: 'teams' | 'slack' | null = null;
+  let slackThreadParentsLoaded = new Set<string>();
+  let slackThreadListQueue = Promise.resolve();
+  let slackThreadListsPending = 0;
   // Folder rail: list of Favorites + user-defined folders the picker
   // shows. Source of truth comes from the content script's IDB read
   // (see listConversationsFromIdb). System-computed folders are stripped
@@ -432,6 +441,35 @@
   async function loadConversations(opts: { forceRefresh?: boolean } = {}) {
     if (currentTabId == null) return;
 
+    if (currentSource === 'slack') {
+      pickerState = 'loading';
+      pickerError = '';
+      try {
+        const response = await runtimeSend(runtime, {
+          type: 'SLACK_LIST_CONVERSATIONS',
+          tabId: currentTabId,
+        });
+        if (!response || response.ok !== true) {
+          throw new Error(response?.ok === false ? response.error : 'Could not load Slack conversations.');
+        }
+        conversations = response.conversations;
+        selectedConversationIds = selectedConversationIds.filter(id => response.conversations.some(item => item.id === id));
+        slackThreadParentsLoaded = new Set();
+        slackThreadSelectionSnapshot = new Set();
+        folders = [];
+        selectedFolderId = 'all';
+        if (selectedKind === 'meeting') selectedKind = 'all';
+        didAutoPickDefault = true;
+        pickerState = 'ok';
+        onConversationSelectionChange(selectedConversationIds);
+      } catch (error) {
+        conversations = [];
+        pickerState = 'error';
+        pickerError = error instanceof Error ? error.message : 'Could not load Slack conversations.';
+      }
+      return;
+    }
+
     // Hydrate from cache immediately when available. The user sees a
     // populated picker within a few ms.
     const cached = opts.forceRefresh ? null : await readCachedList();
@@ -559,6 +597,51 @@
       isRefreshingList = false;
     }
   }
+
+  function onConversationSelectionChange(ids: string[]) {
+    if (currentSource !== 'slack') return;
+    const previous = slackThreadSelectionSnapshot;
+    slackThreadSelectionSnapshot = new Set(ids);
+    const added = ids.filter(id => !previous.has(id));
+    if (added.length !== 1 || added[0].startsWith('slack-thread:')) return;
+    const conversationId = added[0];
+    if (slackThreadParentsLoaded.has(conversationId)) return;
+    slackThreadParentsLoaded.add(conversationId);
+    slackThreadListsPending++;
+    isRefreshingList = true;
+    slackThreadListQueue = slackThreadListQueue.then(async () => {
+      const response = await runtimeSend<SlackListThreadsRequest>(runtime, {
+        type: 'SLACK_LIST_THREADS',
+        tabId: currentTabId,
+        conversationId,
+      }) as SlackListThreadsResponse;
+      if (response?.ok) {
+        const present = new Set(conversations.map(item => item.id));
+        const parentKey = `slack-thread:${conversationId.slice('slack:'.length)}:`;
+        const threads = Array.isArray(response.threads)
+          ? response.threads.filter(item => item
+            && typeof item.id === 'string'
+            && item.id.startsWith(parentKey)
+            && ['chat', 'group', 'channel'].includes(item.kind)
+            && typeof item.name === 'string'
+            && !present.has(item.id))
+          : [];
+        conversations = [...conversations, ...threads]
+          .sort((a, b) => (b.lastActivity || '').localeCompare(a.lastActivity || ''));
+      } else {
+        slackThreadParentsLoaded.delete(conversationId);
+        showErrorBanner(response?.error || 'Could not load Slack threads.');
+      }
+    }).catch(() => {
+      slackThreadParentsLoaded.delete(conversationId);
+      showErrorBanner('Could not load Slack threads.');
+    }).finally(() => {
+      slackThreadListsPending = Math.max(0, slackThreadListsPending - 1);
+      isRefreshingList = slackThreadListsPending > 0;
+    });
+  }
+
+  let slackThreadSelectionSnapshot = new Set<string>();
 
   // History state. Loaded once on mount, refreshed when an entry is appended
   // (popup hears phase=complete or phase=cancelled), and after the user opens
@@ -1048,9 +1131,11 @@
     }
   };
 
-  const getActiveTeamsTab = async () => {
+  const getActiveSourceTab = async () => {
     const [tab] = await tabs.query({ active: true, currentWindow: true });
-    if (!tab || !isTeamsUrl(tab.url)) throw new Error(t("errors.needsTeams"));
+    if (tab && isTeamsUrl(tab.url)) currentSource = 'teams';
+    else if (tab && isSlackUrl(tab.url)) currentSource = 'slack';
+    else throw new Error(t("errors.needsTeams"));
     return tab;
   };
 
@@ -1285,7 +1370,7 @@
       resetPhaseTracker();
       setBusy(true);
       setStatus(t("status.preparing", {}, currentLang()));
-      const tab = await getActiveTeamsTab();
+      const tab = await getActiveSourceTab();
       if (!alive) return;
       currentTabId = tab.id ?? null;
       await pingSW();
@@ -1304,6 +1389,61 @@
         exportTarget,
       } = options;
       setStatus(t("status.running", {}, currentLang()));
+
+      if (currentSource === 'slack') {
+        const langNow = options.lang || 'en';
+        const selected = selectedConversationIds.map(id => {
+          const conversation = conversations.find(item => item.id === id);
+          return {
+            id,
+            title: conversation ? conversationDisplayName(conversation, langNow, t) : id,
+          };
+        });
+        const response = await runtimeSend<StartSlackExportRequest>(runtime, {
+          type: 'START_SLACK_EXPORT',
+          data: {
+            tabId: tab.id,
+            conversations: selected,
+            ...(ingestProjectName !== undefined ? { ingestProjectName } : {}),
+            scrapeOptions: {
+              startAt: range.startISO,
+              endAt: range.endISO,
+              includeReplies,
+            },
+            buildOptions: {
+              formats,
+              saveAs: true,
+              embedAvatars,
+              downloadImages,
+              downloadFiles,
+              attachmentSizeCapMb: options.attachmentSizeCapMb,
+              imageFilenameDate,
+              imageModifiedDate,
+              afterExport: options.afterExport,
+              avatarMode: options.avatarMode,
+              pdfPageSize: options.pdfPageSize,
+              pdfBodyFontSize: options.pdfBodyFontSize,
+              pdfShowPageNumbers: options.pdfShowPageNumbers,
+              pdfIncludeAvatars: options.pdfIncludeAvatars,
+            },
+          },
+        }) as StartSlackExportResponse;
+        if (response?.cancelled) {
+          setStatus(t('status.cancelled', {}, currentLang()) || 'Cancelled', { stopElapsed: true });
+          return;
+        }
+        if (!response || response.error) {
+          throw new Error(response ? responseErrorMessage(response) : t('status.error', {}, currentLang()));
+        }
+        if (response.sent && ingestProjectName !== undefined) {
+          recentProjectNames = await rememberRecentProjectName(storage.local, ingestProjectName);
+        }
+        setStatus(response.filename
+          ? `${response.sent ? t('ebi.sent', {}, langNow) : t('status.complete', {}, langNow)} (${response.filename.split('/').pop()})`
+          : response.sent ? t('ebi.sent', {}, langNow) : t('status.complete', {}, langNow));
+        hideErrorBanner(true);
+        return;
+      }
 
       // Multi-chat bundle path. When the picker has 2+ selections we
       // route to START_BUNDLE_EXPORT instead — same per-chat scrape
@@ -1672,7 +1812,7 @@
         }
       }
       try {
-        const tab = await getActiveTeamsTab();
+        const tab = await getActiveSourceTab();
         currentTabId = tab.id ?? null;
 
         // Restore the saved picker kind BEFORE loadConversations fires —
@@ -1912,6 +2052,7 @@
         errorMessage={pickerError}
         refreshing={isRefreshingList}
         notOnTeams={notOnTeamsTab}
+        on:change={(event) => onConversationSelectionChange(event.detail)}
         on:retry={() => loadConversations({ forceRefresh: true })}
         on:folderChange={(e) => persistFolderChoice(e.detail)}
         on:kindChange={(e) => persistKindChoice(e.detail)}
@@ -1923,7 +2064,7 @@
 
       <!-- Export button — plain in every state. Outcomes live in History page. -->
       <ExportButton
-        disabled={selectedConversationIds.length === 0}
+        disabled={selectedConversationIds.length === 0 || slackThreadListsPending > 0}
         selectionCount={selectedConversationIds.length}
         selectionIsOther={singleSelectionIsOther}
         {busy}
@@ -1942,7 +2083,7 @@
       <EbiIngestSection
         bind:projectName={ebiProjectName}
         {recentProjectNames}
-        disabled={selectedConversationIds.length === 0}
+        disabled={selectedConversationIds.length === 0 || slackThreadListsPending > 0}
         {busy}
         lang={options.lang || "en"}
         on:send={startEbiIngest}

@@ -61,6 +61,42 @@ export type StartBundleExportResponse = {
   sent?: boolean;
 };
 
+export type StartSlackExportRequest = {
+  type: 'START_SLACK_EXPORT';
+  data: {
+    tabId?: number | null;
+    conversations: Array<{ id: string; title: string }>;
+    scrapeOptions: Pick<ScrapeOptions, 'startAt' | 'endAt' | 'includeReplies'>;
+    buildOptions: BuildOptions;
+    ingestProjectName?: string;
+  };
+};
+export type StartSlackExportResponse = {
+  ok?: boolean;
+  filename?: string;
+  downloadId?: number;
+  totalChats?: number;
+  successChats?: number;
+  failedChats?: number;
+  messages?: number;
+  cancelled?: boolean;
+  code?: string;
+  error?: string;
+  errorCode?: string;
+  errorDetail?: string;
+  errorStatus?: number;
+  sent?: boolean;
+};
+
+export type SlackListConversationsRequest = { type: 'SLACK_LIST_CONVERSATIONS'; tabId?: number | null };
+export type SlackListConversationsResponse =
+  | { ok: true; workspaces: Array<{ id: string; name: string }>; conversations: ConversationSummary[] }
+  | { ok: false; error: string };
+export type SlackListThreadsRequest = { type: 'SLACK_LIST_THREADS'; tabId?: number | null; conversationId: string };
+export type SlackListThreadsResponse =
+  | { ok: true; threads: ConversationSummary[] }
+  | { ok: false; error: string };
+
 // Low-level "I have a payload, write a file" entry. Single-format only —
 // multi-format end-user exports go through START_EXPORT (which routes to
 // buildAndDownloadBundle in the SW). If a future caller needs bundle
@@ -296,9 +332,12 @@ export type RuntimeRequest =
   | GetExportStatusRequest
   | StartExportRequest
   | StartBundleExportRequest
+  | StartSlackExportRequest
   | StopExportRequest
   | BuildAndDownloadRequest
   | ListConversationsRequest
+  | SlackListConversationsRequest
+  | SlackListThreadsRequest
   | ListConversationsQuickRequest
   | GetDiagnosticsBgRequest
   | RunProbesBgRequest
@@ -313,6 +352,7 @@ export type BackgroundIncomingMessage =
   | GetExportStatusRequest
   | StartExportRequest
   | StartBundleExportRequest
+  | StartSlackExportRequest
   | StopExportRequest
   | BuildAndDownloadRequest
   | ExportStatusUpdateMessage
@@ -321,6 +361,8 @@ export type BackgroundIncomingMessage =
   | FetchBlobDirectRequest
   | FallbackStatusRequest
   | ListConversationsRequest
+  | SlackListConversationsRequest
+  | SlackListThreadsRequest
   | ListConversationsQuickRequest
   | GetDiagnosticsBgRequest
   | RunProbesBgRequest
@@ -336,8 +378,11 @@ export type RuntimeResponse<T extends RuntimeRequest> =
   T extends GetExportStatusRequest ? GetExportStatusResponse :
   T extends StartExportRequest ? StartExportResponse :
   T extends StartBundleExportRequest ? StartBundleExportResponse :
+  T extends StartSlackExportRequest ? StartSlackExportResponse :
   T extends StopExportRequest ? StopExportResponse :
   T extends ListConversationsRequest ? ListConversationsResponse :
+  T extends SlackListConversationsRequest ? SlackListConversationsResponse :
+  T extends SlackListThreadsRequest ? SlackListThreadsResponse :
   T extends ListConversationsQuickRequest ? ListConversationsQuickResponse :
   T extends GetDiagnosticsBgRequest ? GetDiagnosticsBgResponse :
   T extends RunProbesBgRequest ? RunProbesBgResponse :
