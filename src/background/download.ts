@@ -219,7 +219,7 @@ function stripAttachmentDataUrl(att: Attachment) {
   // shareUrl is an internal sharing link for the Files-phase resolver; failHref
   // is an internal dedup aid for the failure manifest. Like dataUrl, neither
   // must reach the serialized export output.
-  const { dataUrl, shareUrl, failHref, ...rest } = att;
+  const { dataUrl, shareUrl, failHref, fileAttachment, ...rest } = att;
   return rest;
 }
 
@@ -276,6 +276,7 @@ function applyInlineImages(messages: ExportMessage[], mode: ImageMode, withDate 
     const dataUrl = att.dataUrl || (att.href && att.href.startsWith('data:') ? att.href : null);
     const base = stripAttachmentDataUrl(att);
     if (!dataUrl) return base;
+    if (att.fileAttachment) return base;
     // Keep audio data URLs inline (not as image files)
     if (att.type === 'audio') {
       return { ...base, dataUrl };
@@ -805,6 +806,29 @@ export async function buildOneChatForBundle(
   const { messages, meta, formats, embedAvatars, downloadImages, imageFilenameDate = false, imageModifiedDate = false, avatarMode, onPdfProgress } = options;
   if (!formats.length) throw new Error('buildOneChatForBundle: formats is empty');
 
+  const attachmentNames = new Set<string>();
+  const attachmentPaths = new Map<string, string>();
+  const attachmentFiles: PerChatFile[] = [];
+  const buildMessages = messages.map(message => ({
+    ...message,
+    attachments: message.attachments?.map(attachment => {
+      if (!attachment.fileAttachment || !attachment.dataUrl) return attachment;
+      let path = attachmentPaths.get(attachment.dataUrl);
+      if (!path) {
+        const bytes = dataUrlToBytes(attachment.dataUrl);
+        if (!bytes) return attachment;
+        const baseName = (attachment.label || 'attachment')
+          .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+          .replace(/^\.+/, '')
+          .slice(0, 120) || 'attachment';
+        path = `attachments/${ensureUniqueName(baseName, attachmentNames)}`;
+        attachmentPaths.set(attachment.dataUrl, path);
+        attachmentFiles.push({ relativePath: path, data: bytes });
+      }
+      return { ...attachment, href: path };
+    }),
+  }));
+
   const needAvatarsAsFiles = embedAvatars && formats.includes('html') && avatarMode === 'files';
   const avatarCollect = needAvatarsAsFiles ? collectAvatarFiles(meta) : { files: [], meta };
   const htmlMeta = avatarCollect.meta;
@@ -816,6 +840,8 @@ export async function buildOneChatForBundle(
   const formatFailures: PerChatFormatFailure[] = [];
   const imagePaths = new Set<string>();
   const encoder = new TextEncoder();
+
+  out.push(...attachmentFiles);
 
   for (const a of avatarCollect.files) {
     const bytes = dataUrlToBytes(a.dataUrl);
@@ -847,14 +873,14 @@ export async function buildOneChatForBundle(
     try {
       console.log(`[bundle] building ${format} for "${titleForLog}"`);
       if (format === 'pdf') {
-        const bytes = await buildPdfResilient(messages, pdfMetaWithStats(meta, messages), onPdfProgress, toPdfOptions(options));
+        const bytes = await buildPdfResilient(buildMessages, pdfMetaWithStats(meta, buildMessages), onPdfProgress, toPdfOptions(options));
         out.push({ relativePath: 'messages.pdf', data: bytes });
         continue;
       }
 
       const mode: ImageMode = format === 'html' ? htmlImageMode : 'none';
       const formatMeta = format === 'html' ? htmlMeta : meta;
-      const built = buildExportInternal({ messages, meta: formatMeta, format, embedAvatars, downloadImages, imageFilenameDate, imageModifiedDate }, mode);
+      const built = buildExportInternal({ messages: buildMessages, meta: formatMeta, format, embedAvatars, downloadImages, imageFilenameDate, imageModifiedDate }, mode);
 
       const contentParts = Array.isArray(built.content) ? built.content : [built.content];
       const encodedParts = contentParts.map(part => encoder.encode(part));
@@ -887,7 +913,7 @@ export async function buildOneChatForBundle(
     }
   }
   // Manifest of images/files that could not be fetched, alongside images/.
-  const failManifest = buildImagesFailedManifest(messages);
+  const failManifest = buildImagesFailedManifest(buildMessages);
   if (failManifest) out.push({ relativePath: 'IMAGES_FAILED.txt', data: encoder.encode(failManifest) });
 
   return { files: out, formatFailures };
@@ -962,7 +988,7 @@ export async function buildAndDownloadBundlesZip(
   failures: BundleFailure[],
   noHistory: BundleEmpty[] = [],
   partials: BundlePartial[] = [],
-  opts: { packageFolder?: boolean } = {},
+  opts: { packageFolder?: boolean; filenamePrefix?: string } = {},
 ) {
   const { downloads } = deps;
 
@@ -1025,7 +1051,7 @@ export async function buildAndDownloadBundlesZip(
   // bundle is partial. Visible in the OS file browser without
   // opening the zip.
   const partialSuffix = partials.length ? '-PARTIAL' : '';
-  const zipName = `TeamsExport_bundle_${stamp}${partialSuffix}.zip`;
+  const zipName = `${opts.filenamePrefix || 'TeamsExport'}_bundle_${stamp}${partialSuffix}.zip`;
   if (deps.onBuiltFile) {
     await deps.onBuiltFile(zipBlob, zipName, 'application/zip');
     return { ok: true, filename: zipName, sent: true };

@@ -2,8 +2,14 @@ export const EBI_INGEST_SETTINGS_KEY = 'teamsExporterEbiIngest';
 export const EBI_RECENT_PROJECTS_KEY = 'teamsExporterEbiRecentProjects';
 export const MAX_INGEST_REQUEST_BYTES = 50 * 1024 * 1024;
 
+export type IngestSource = 'teams' | 'slack';
+export const INGEST_SOURCES: Record<IngestSource, { displayName: string; folderName: string; tag: string }> = {
+  teams: { displayName: 'Microsoft Teams', folderName: 'Teams Export', tag: 'teams-import' },
+  slack: { displayName: 'Slack', folderName: 'Slack Export', tag: 'slack-import' },
+};
 export type EbiIngestSettings = { baseUrl: string; token: string };
 export type IngestFile = { blob: Blob; filename: string; mime: string };
+export type IngestAttachmentManifestEntry = { name: string; status: 'embedded' | 'linked' | 'failed' };
 export type EbiIngestErrorCode = 'settings' | 'project' | 'size' | 'network' | 'permission' | 'disabled' | 'unauthorized' | 'conflict' | 'http';
 
 export class EbiIngestError extends Error {
@@ -22,8 +28,8 @@ export type IngestPayload = {
   content: string;
   thread_name: string;
   attachments: Array<{ filename: string; mimetype: string; data: string }>;
-  attachments_manifest: Array<{ name: string; status: 'embedded' }>;
-  tags: ['teams-import'];
+  attachments_manifest: IngestAttachmentManifestEntry[];
+  tags: string[];
 };
 
 type LocalStorageArea = {
@@ -50,16 +56,17 @@ export function ingestPermissionPattern(baseUrl: string): string {
   return `${url.protocol}//${url.host}/*`;
 }
 
-export function buildIngestContent(projectName: string, conversationNames: string[]): string {
+export function buildIngestContent(projectName: string, conversationNames: string[], source: IngestSource = 'teams'): string {
+  const sourceInfo = INGEST_SOURCES[source];
   const project = projectName.trim();
   const conversations = conversationNames.map((name) => name.trim()).filter(Boolean);
   return [
-    'この添付ファイルは Microsoft Teams の会話エクスポートです。Ebi Workspace（Obsidian vault）に保存してください。',
+    `この添付ファイルは ${sourceInfo.displayName} の会話エクスポートです。Ebi Workspace（Obsidian vault）に保存してください。`,
     `保存先プロジェクト名（検索用の値）: ${JSON.stringify(project)}`,
     `対象会話名: ${JSON.stringify(conversations)}`,
     '',
     'Ebi Workspace の `02_Contexts/<コンテキスト>/<プロジェクト>/` 以下から、入力された名前に合うプロジェクトフォルダを特定してください。',
-    '一意に特定できた場合、その中に `Teams Export/<会話名>/` を作成し、各会話に対応する受信ファイルを保存してください。',
+    `一意に特定できた場合、その中に \`${sourceInfo.folderName}/<会話名>/\` を作成し、各会話に対応する受信ファイルを保存してください。`,
     '受信ファイルの内容を要約・再構成・改変せず、ファイルをそのまま保存してください。',
     '候補が複数ある場合、または一致するプロジェクトがない場合は、何も保存せず、候補または未検出の理由を添えてユーザーに確認してください。',
     '保存できた場合は、実際に保存した Ebi Workspace 内のパスを報告してください。',
@@ -108,8 +115,9 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-function makeThreadName(projectName: string): string {
-  return `Teams import: ${projectName.replace(/[\r\n]+/g, ' ').slice(0, 70)}`;
+function makeThreadName(projectName: string, source: IngestSource): string {
+  const sourceName = source === 'teams' ? 'Teams' : INGEST_SOURCES[source].displayName;
+  return `${sourceName} import: ${projectName.replace(/[\r\n]+/g, ' ').slice(0, 70)}`;
 }
 
 export async function prepareIngestRequest(
@@ -117,6 +125,8 @@ export async function prepareIngestRequest(
   file: IngestFile,
   projectName: string,
   conversationNames: string[],
+  source: IngestSource = 'teams',
+  attachmentManifest: readonly IngestAttachmentManifestEntry[] = [],
 ): Promise<{ url: string; headers: Record<string, string>; body: string }> {
   const baseUrl = normalizeIngestBaseUrl(settings.baseUrl);
   const token = settings.token.trim();
@@ -124,14 +134,18 @@ export async function prepareIngestRequest(
   if (!token) throw new EbiIngestError('settings', 'Set the Ingest API token in Settings first.');
   if (!project) throw new EbiIngestError('project', 'Enter an Ebi Workspace project name first.');
 
-  const content = buildIngestContent(project, conversationNames);
+  const sourceInfo = INGEST_SOURCES[source];
+  const content = buildIngestContent(project, conversationNames, source);
   const attachmentDataLength = 4 * Math.ceil(file.blob.size / 3);
   const payload: IngestPayload = {
     content,
-    thread_name: makeThreadName(project),
+    thread_name: makeThreadName(project, source),
     attachments: [{ filename: file.filename, mimetype: file.mime, data: '' }],
-    attachments_manifest: [{ name: file.filename, status: 'embedded' }],
-    tags: ['teams-import'],
+    attachments_manifest: [
+      { name: file.filename, status: 'embedded' },
+      ...attachmentManifest,
+    ],
+    tags: [sourceInfo.tag],
   };
   const estimatedBytes = estimateIngestRequestBytes(payload, attachmentDataLength);
   if (estimatedBytes > MAX_INGEST_REQUEST_BYTES) {
@@ -163,8 +177,10 @@ export async function sendToEbiIngest(
   projectName: string,
   conversationNames: string[],
   fetcher: typeof fetch = fetch,
+  source: IngestSource = 'teams',
+  attachmentManifest: readonly IngestAttachmentManifestEntry[] = [],
 ): Promise<unknown> {
-  const request = await prepareIngestRequest(settings, file, projectName, conversationNames);
+  const request = await prepareIngestRequest(settings, file, projectName, conversationNames, source, attachmentManifest);
   let response: Response;
   try {
     response = await fetcher(request.url, {
