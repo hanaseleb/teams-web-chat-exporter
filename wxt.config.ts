@@ -100,7 +100,8 @@ export default defineConfig({
     //   - Firefox MV2: combined into `optional_permissions`.
     // Listing in optional_* never appears in the install dialog —
     // it's invisible until permissions.request() is called from the
-    // Settings toggle.
+    // Settings controls. Ingest requests just the configured origin at
+    // runtime; <all_urls> declares which origins it may request.
     ...(manifestVersion === 3
       ? { optional_host_permissions: ['<all_urls>'] as any }
       : { optional_permissions: ['<all_urls>'] as any }

@@ -32,6 +32,9 @@ export type BuildDownloadDeps = {
   // skip it entirely. For a multi-format single-chat bundle it fires once
   // per format (the per-format content bytes, pre-zip).
   onArtifact?: (artifact: { format: string; bytes: number }) => void;
+  // Alternate destination used by Ebi ingest. Builders still produce the
+  // exact same file/zip; only the final delivery step changes.
+  onBuiltFile?: (blob: Blob, filename: string, mime: string) => Promise<void>;
 };
 
 type SingleFormat = 'json' | 'csv' | 'html' | 'txt' | 'pdf';
@@ -440,7 +443,12 @@ export async function buildAndDownload(
     }, toPdfOptions(options));
     onStatus?.({ phase: 'build', filename, messages: messages.length, messagesBuilt: messages.length, messagesTotal: messages.length });
     onArtifact?.({ format: 'pdf', bytes: bytes.byteLength });
-    const url = await blobToDownloadUrl(new Blob([bytes as BlobPart], { type: 'application/pdf' }), 'application/pdf');
+    const blob = new Blob([bytes as BlobPart], { type: 'application/pdf' });
+    if (deps.onBuiltFile) {
+      await deps.onBuiltFile(blob, filename, 'application/pdf');
+      return { ok: true, filename, sent: true };
+    }
+    const url = await blobToDownloadUrl(blob, 'application/pdf');
     const pp = packagePath(filename, packageFolder);
     try {
       console.log(`[pdf-single] downloads.download calling: filename=${pp.filename} bytes=${bytes.byteLength}`);
@@ -479,6 +487,10 @@ export async function buildAndDownload(
 
   const blob = new Blob(Array.isArray(built.content) ? built.content : [built.content], { type: built.mime });
   onArtifact?.({ format, bytes: blob.size });
+  if (deps.onBuiltFile) {
+    await deps.onBuiltFile(blob, built.filename, built.mime);
+    return { ok: true, filename: built.filename, sent: true };
+  }
   const url = await blobToDownloadUrl(blob, built.mime);
   const pp = packagePath(built.filename, packageFolder);
   try {
@@ -587,6 +599,10 @@ export async function buildAndDownloadZip(
 
   const zipBlob = await buildZipAsync(files, 'zip-html-images');
   const zipName = `${built.baseFolder}.zip`;
+  if (deps.onBuiltFile) {
+    await deps.onBuiltFile(zipBlob, zipName, 'application/zip');
+    return { ok: true, filename: zipName, sent: true };
+  }
   const url = await blobToDownloadUrl(zipBlob, 'application/zip');
   const pp = packagePath(zipName, packageFolder);
   try {
@@ -727,6 +743,10 @@ export async function buildAndDownloadBundle(
 
   const zipBlob = await buildZipAsync(files, 'zip-per-chat-bundle');
   const zipName = `${baseFolder}.zip`;
+  if (deps.onBuiltFile) {
+    await deps.onBuiltFile(zipBlob, zipName, 'application/zip');
+    return { ok: true, filename: zipName, sent: true };
+  }
   const tUrl = performance.now();
   const url = await blobToDownloadUrl(zipBlob, 'application/zip');
   console.log(`[per-chat-zip] download-url created in ${Math.round(performance.now() - tUrl)}ms (zipBytes=${zipBlob.size}, scheme=${url.slice(0, 5)})`);
@@ -1006,6 +1026,10 @@ export async function buildAndDownloadBundlesZip(
   // opening the zip.
   const partialSuffix = partials.length ? '-PARTIAL' : '';
   const zipName = `TeamsExport_bundle_${stamp}${partialSuffix}.zip`;
+  if (deps.onBuiltFile) {
+    await deps.onBuiltFile(zipBlob, zipName, 'application/zip');
+    return { ok: true, filename: zipName, sent: true };
+  }
   const tUrl = performance.now();
   const url = await blobToDownloadUrl(zipBlob, 'application/zip');
   console.log(`[bundle-outer] download-url created in ${Math.round(performance.now() - tUrl)}ms (scheme=${url.slice(0, 5)})`);

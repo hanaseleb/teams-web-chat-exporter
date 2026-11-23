@@ -10,6 +10,7 @@ import {
   pickBundleFolderName,
   type BundleEmpty,
   type BundleFailure,
+  type BuildDownloadDeps,
 } from '../background/download';
 import {
   collectDocumentAttachments,
@@ -28,6 +29,13 @@ import { revokeDownloadUrl, textToDownloadUrl } from '../background/builders';
 import { createZipStream, type ZipStream } from '../background/zip';
 import { beginExportStats, endExportStats, getExportStats } from '../background/export-stats';
 import { clearTransferBlobs } from '../utils/blob-transfer';
+import {
+  EbiIngestError,
+  ingestPermissionPattern,
+  loadIngestSettings,
+  sendToEbiIngest,
+  type EbiIngestSettings,
+} from '../utils/ebi-ingest';
 import { ACTIVE_EXPORTS_STORAGE_KEY, FIRST_INSTALL_STORAGE_KEY, appendHistoryEntry, clampConcurrency, ATTACH_CONCURRENCY_DEFAULT } from '../utils/options';
 import type { BackgroundIncomingMessage } from '../types/messaging';
 import type {
@@ -239,11 +247,28 @@ const action = typeof browser !== 'undefined'
 const downloads = typeof browser !== 'undefined' ? browser.downloads : chrome.downloads;
 const scripting = typeof browser !== 'undefined' ? browser.scripting : chrome.scripting;
 const storage = typeof browser !== 'undefined' ? browser.storage : chrome.storage;
+const permissions = typeof browser !== 'undefined' ? browser.permissions : chrome.permissions;
 const badge = createBadgeManager(action);
 const { reset: resetBadge, updateForStatus: updateBadgeForStatus, updateForProgress: updateBadgeForProgress } = badge;
 const isFirefox = typeof browser !== 'undefined' && navigator.userAgent.includes('Firefox');
 
 function log(...a: unknown[]) { try { console.log("[Teams Exporter SW]", ...a) } catch { /* never break logging */ } }
+
+async function requireIngestSettings() {
+    const settings = await loadIngestSettings(storage.local);
+    if (!settings) throw new EbiIngestError('settings', 'Set the Ingest API URL and token in Settings first.');
+    let granted = false;
+    try { granted = await permissions.contains({ origins: [ingestPermissionPattern(settings.baseUrl)] }); }
+    catch { /* reported as a missing optional host permission below */ }
+    if (!granted) throw new EbiIngestError('permission', 'Grant the Ingest API host permission in Settings first.');
+    return settings;
+}
+
+function ingestErrorFields(error: unknown): { errorCode?: string; errorDetail?: string; errorStatus?: number } {
+    return error instanceof EbiIngestError
+        ? { errorCode: error.code, errorDetail: error.detail || undefined, errorStatus: error.status }
+        : {};
+}
 // Per-build identifier (git hash + build time), injected at build time. Logged
 // at boot and at each export start/end so any SW console / export can be tied to
 // the exact build — no more guessing whether a stale service worker is running.
@@ -762,10 +787,11 @@ type BuildStep = (
     scrapeRes: ScrapeResult,
     buildOptions: BuildOptions,
     tabId: number,
+    ingestSettings?: EbiIngestSettings,
     // `folder` is set only in package mode (Files toggle on): the Downloads-
     // relative folder the export was saved into, which the attachments phase
     // must reuse verbatim so both land in the same place.
-) => Promise<{ filename?: string; id?: number; folder?: string }>;
+) => Promise<{ filename?: string; id?: number; folder?: string; sent?: boolean }>;
 
 function handleExportWithScrape(
     msg: any,
@@ -791,6 +817,8 @@ function handleExportWithScrape(
 
     const scrapeOptions = data.scrapeOptions || {};
     const buildOptions = data.buildOptions || {};
+    const ingestRequested = data.ingestProjectName !== undefined;
+    let ingestSettings: EbiIngestSettings | undefined;
 
     (async () => {
         let startedAt;
@@ -799,6 +827,12 @@ function handleExportWithScrape(
         let statsOutcome = 'error';
         let statsFilename: string | undefined;
         try {
+            if (ingestRequested) {
+                if (typeof data.ingestProjectName !== 'string' || !data.ingestProjectName.trim()) {
+                    throw new EbiIngestError('project', 'Enter an Ebi Workspace project name first.');
+                }
+                ingestSettings = await requireIngestSettings();
+            }
             await ensureContentScript(tabId);
             const ctx = await checkContext(tabId, scrapeOptions);
             if (!ctx?.ok) {
@@ -845,7 +879,7 @@ function handleExportWithScrape(
                 return;
             }
 
-            const buildRes = await buildStep(scrapeRes, buildOptions, tabId);
+            const buildRes = await buildStep(scrapeRes, buildOptions, tabId, ingestSettings);
 
             // Wait until the download has actually settled on disk.
             // chrome.downloads.download() resolves with the id as soon as
@@ -943,7 +977,7 @@ function handleExportWithScrape(
             // timestamp). The AbortController is registered with the tab so
             // STOP_EXPORT (abortFetchesForTab) stops the phase.
             let filesSummary: AttachmentDownloadSummary | undefined;
-            if (buildOptions?.downloadFiles && buildRes.filename) {
+            if (!buildRes.sent && buildOptions?.downloadFiles && buildRes.filename) {
                 log('Files phase: starting for', (scrapeRes.messages || []).length, 'messages');
                 const exportFolder = buildRes.folder ?? buildRes.filename.replace(/\.[^.\\/]+$/, '');
                 const filesAbort = new AbortController();
@@ -980,7 +1014,7 @@ function handleExportWithScrape(
                 downloadId: buildRes.id,
                 // Forward the setting so the popup can try auto-open from
                 // its own context (see auto-action comment below).
-                afterExport: buildOptions?.afterExport,
+                afterExport: buildRes.sent ? undefined : buildOptions?.afterExport,
                 filesSummary: filesSummary && toFilesSummaryWire(filesSummary),
             });
 
@@ -1051,7 +1085,7 @@ function handleExportWithScrape(
                 }
             }
 
-            sendResponse({ ok: true, filename: buildRes.filename, downloadId: buildRes.id });
+            sendResponse({ ok: true, filename: buildRes.filename, downloadId: buildRes.id, sent: buildRes.sent });
         } catch (err: any) {
             const message = err?.message || String(err);
             // Cancellation flows here as a rejection of the streaming promise
@@ -1068,7 +1102,7 @@ function handleExportWithScrape(
                 log('export failed:', message);
                 if (err?.stack) log('export stack:', err.stack);
                 broadcastStatus({ tabId, phase: 'error', error: message });
-                sendResponse({ error: message });
+                sendResponse({ error: message, ...ingestErrorFields(err) });
             }
         } finally {
             // Emit the console-only stats block, then drop the collector. Runs
@@ -1082,7 +1116,7 @@ function handleExportWithScrape(
 }
 
 function handleStartExportMessage(msg: any, sendResponse: (res: any) => void) {
-    handleExportWithScrape(msg, sendResponse, async (scrapeRes, buildOptions, tabId) => {
+    handleExportWithScrape(msg, sendResponse, async (scrapeRes, buildOptions, tabId, ingestSettings) => {
         // Sanitize the formats array. The popup always sends one, but be
         // defensive — a corrupt/legacy payload reaching the SW would
         // otherwise crash the build switch below.
@@ -1096,12 +1130,23 @@ function handleStartExportMessage(msg: any, sendResponse: (res: any) => void) {
         // per-attachment failReason so no reason word, summary banner, or
         // IMAGES_FAILED.txt manifest is produced (plain "(not included)").
         if (buildOptions.explainMissing === false) stripFailReasons(scrapeRes.messages || []);
-        const deps = {
+        const ingestProjectName = typeof msg.data?.ingestProjectName === 'string'
+            ? msg.data.ingestProjectName.trim()
+            : '';
+        const deps: BuildDownloadDeps = {
             downloads,
             isFirefox,
             onStatus: (payload: Record<string, unknown>) => broadcastStatus({ ...payload, tabId }),
             // Per-format output sizes for the console-only stats block.
             onArtifact: (a: { format: string; bytes: number }) => getExportStats(tabId)?.addFormat(a.format, a.bytes),
+            onBuiltFile: ingestSettings ? async (blob, filename, mime) => {
+                await sendToEbiIngest(
+                    ingestSettings,
+                    { blob, filename, mime },
+                    ingestProjectName,
+                    [String(scrapeRes.meta?.title || msg.data?.scrapeOptions?.conversationTitle || 'Unknown conversation')],
+                );
+            } : undefined,
         };
         // PDF knobs — plumb through to every build path that might
         // produce a PDF. Safe to pass even when PDF isn't selected;
@@ -1127,7 +1172,7 @@ function handleStartExportMessage(msg: any, sendResponse: (res: any) => void) {
         const avatarMode = buildOptions.avatarMode === 'files' ? 'files' : 'inline';
         // Files toggle on -> package mode: the export saves INSIDE its base
         // folder (saveAs:false) so the attachments/ tree lands beside it.
-        const packageFolder = Boolean(buildOptions.downloadFiles);
+        const packageFolder = Boolean(buildOptions.downloadFiles && !ingestSettings);
         if (formats.length >= 2) {
             return buildAndDownloadBundle(deps, { ...commonOpts, formats, avatarMode, packageFolder });
         }
@@ -1160,6 +1205,8 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
     const list: Array<{ id: string; title: string }> = Array.isArray(data.conversations) ? data.conversations : [];
     const buildOptions: BuildOptions = data.buildOptions || {};
     const baseScrapeOptions: ScrapeOptions = data.scrapeOptions || {};
+    const ingestRequested = data.ingestProjectName !== undefined;
+    const ingestProjectName = typeof data.ingestProjectName === 'string' ? data.ingestProjectName.trim() : '';
 
     if (typeof tabId !== 'number') {
         sendResponse({ error: 'Missing tabId for bundle export request' });
@@ -1167,6 +1214,10 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
     }
     if (!list.length) {
         sendResponse({ error: 'No conversations selected for bundle export' });
+        return;
+    }
+    if (ingestRequested && !ingestProjectName) {
+        sendResponse({ error: 'Enter an Ebi Workspace project name first.', errorCode: 'project' });
         return;
     }
     const existing = activeExports.get(tabId);
@@ -1202,11 +1253,36 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
         } catch (e: any) {
             const message = e?.message || String(e);
             broadcastStatus({ tabId, phase: 'error', error: message });
-            sendResponse({ error: message });
+            sendResponse({ error: message, ...ingestErrorFields(e) });
             endExportStats(tabId);
             activeExports.delete(tabId); void persistActiveExports();
             return;
         }
+
+        let ingestSettings: EbiIngestSettings | undefined;
+        if (ingestRequested) {
+            try {
+                ingestSettings = await requireIngestSettings();
+            } catch (e: any) {
+                const message = e?.message || String(e);
+                broadcastStatus({ tabId, phase: 'error', error: message });
+                sendResponse({ error: message, ...ingestErrorFields(e) });
+                endExportStats(tabId);
+                activeExports.delete(tabId); void persistActiveExports();
+                return;
+            }
+        }
+        const conversationNames = list.map((conv) => conv.title || conv.id);
+        const onBuiltFile: BuildDownloadDeps['onBuiltFile'] = ingestSettings
+            ? async (blob, filename, mime) => {
+                await sendToEbiIngest(
+                    ingestSettings!,
+                    { blob, filename, mime },
+                    ingestProjectName,
+                    conversationNames,
+                );
+            }
+            : undefined;
 
         const totalChats = list.length;
         const usedFolderNames = new Set<string>();
@@ -1515,17 +1591,22 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
                 + '# the Teams Free chat backend. Not a failure; nothing to export.\n'
                 + '# Columns: folder\tconversationId';
             const body = `${header}\n${lines.join('\n')}\n`;
-            const url = textToDownloadUrl(body, 'text/plain');
 
             let downloadId: number | undefined;
+            let downloadUrl: string | undefined;
             try {
-                downloadId = await downloads.download({ url, filename, saveAs: true });
-                setTimeout(() => revokeDownloadUrl(url), 60_000);
+                if (onBuiltFile) {
+                    await onBuiltFile(new Blob([body], { type: 'text/plain' }), filename, 'text/plain');
+                } else {
+                    downloadUrl = textToDownloadUrl(body, 'text/plain');
+                    downloadId = await downloads.download({ url: downloadUrl, filename, saveAs: true });
+                    setTimeout(() => revokeDownloadUrl(downloadUrl!), 60_000);
+                }
             } catch (e: any) {
-                revokeDownloadUrl(url);
+                if (downloadUrl) revokeDownloadUrl(downloadUrl);
                 const message = e?.message || String(e);
                 broadcastStatus({ tabId, phase: 'error', error: message });
-                sendResponse({ error: message });
+                sendResponse({ error: message, ...ingestErrorFields(e) });
                 activeExports.delete(tabId); void persistActiveExports();
                 return;
             }
@@ -1535,7 +1616,7 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
                 phase: 'complete',
                 filename,
                 downloadId,
-                afterExport: buildOptions?.afterExport,
+                afterExport: onBuiltFile ? undefined : buildOptions?.afterExport,
                 bundleTotalChats: totalChats,
                 bundleSuccessCount: 0,
                 bundleFailedCount: 0,
@@ -1566,6 +1647,7 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
                 totalChats,
                 successChats: 0,
                 failedChats: 0,
+                sent: Boolean(onBuiltFile),
             });
             activeExports.delete(tabId); void persistActiveExports();
             return;
@@ -1583,19 +1665,24 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
             const lines = failures.map(f => `${f.folderName}\t${f.conversationId}\t${f.reason}`);
             const header = '# Chats that failed to export. Columns: folder\tconversationId\treason';
             const body = `${header}\n${lines.join('\n')}\n`;
-            const url = textToDownloadUrl(body, 'text/plain');
 
             let downloadId: number | undefined;
+            let downloadUrl: string | undefined;
             try {
-                downloadId = await downloads.download({ url, filename, saveAs: true });
-                console.log(`[bundle-allfail] downloads.download resolved: id=${downloadId} filename=${filename}`);
-                setTimeout(() => revokeDownloadUrl(url), 60_000);
+                if (onBuiltFile) {
+                    await onBuiltFile(new Blob([body], { type: 'text/plain' }), filename, 'text/plain');
+                } else {
+                    downloadUrl = textToDownloadUrl(body, 'text/plain');
+                    downloadId = await downloads.download({ url: downloadUrl, filename, saveAs: true });
+                    console.log(`[bundle-allfail] downloads.download resolved: id=${downloadId} filename=${filename}`);
+                    setTimeout(() => revokeDownloadUrl(downloadUrl!), 60_000);
+                }
             } catch (e: any) {
                 console.log(`[bundle-allfail] downloads.download rejected: ${e?.message || String(e)}`);
-                revokeDownloadUrl(url);
+                if (downloadUrl) revokeDownloadUrl(downloadUrl);
                 const message = e?.message || String(e);
                 broadcastStatus({ tabId, phase: 'error', error: message });
-                sendResponse({ error: message });
+                sendResponse({ error: message, ...ingestErrorFields(e) });
                 activeExports.delete(tabId); void persistActiveExports();
                 return;
             }
@@ -1605,7 +1692,7 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
                 phase: 'complete',
                 filename,
                 downloadId,
-                afterExport: buildOptions?.afterExport,
+                afterExport: onBuiltFile ? undefined : buildOptions?.afterExport,
                 bundleTotalChats: totalChats,
                 bundleSuccessCount: 0,
                 bundleFailedCount: failures.length,
@@ -1636,6 +1723,7 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
                 totalChats,
                 successChats: 0,
                 failedChats: failures.length,
+                sent: Boolean(onBuiltFile),
             });
             activeExports.delete(tabId); void persistActiveExports();
             return;
@@ -1655,12 +1743,14 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
             // and every entries.push is preceded by creating bundleZip, so it
             // is non-null. Guard defensively anyway.
             if (!bundleZip) throw new Error('bundle zip stream missing despite built chats');
-            const bundlePackageMode = Boolean(buildOptions?.downloadFiles);
+            const bundlePackageMode = Boolean(buildOptions?.downloadFiles && !ingestSettings);
             const buildRes = await buildAndDownloadBundlesZip(
-                { downloads, isFirefox }, bundleZip, entries.length, failures, noHistory, partials,
+                { downloads, isFirefox, onBuiltFile }, bundleZip, entries.length, failures, noHistory, partials,
                 { packageFolder: bundlePackageMode },
             );
-            if (bundlePackageMode && buildRes.id != null) {
+            if (buildRes.sent) {
+                // No local download or post-export attachment pass for ingest.
+            } else if (bundlePackageMode && buildRes.id != null) {
                 // Package mode: same confirmed-terminal wait as the single-chat
                 // path — the Files phase must not run against an unsaved zip,
                 // and there is no proceed-on-timeout.
@@ -1718,7 +1808,7 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
             // zip name (= export folder base) is known. Registered with the tab
             // so STOP_EXPORT cancels the in-flight resolver fetches.
             let filesSummary: AttachmentDownloadSummary | undefined;
-            if (buildOptions?.downloadFiles && bundleAttachItems.length && buildRes.filename && !bundleStops.has(tabId)) {
+            if (!buildRes.sent && buildOptions?.downloadFiles && bundleAttachItems.length && buildRes.filename && !bundleStops.has(tabId)) {
                 const exportFolder = buildRes.folder ?? buildRes.filename.replace(/\.zip$/i, '');
                 const filesAbort = new AbortController();
                 trackFetch(tabId, filesAbort);
@@ -1751,7 +1841,7 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
                 phase: 'complete',
                 filename: buildRes.filename,
                 downloadId: buildRes.id,
-                afterExport: buildOptions?.afterExport,
+                afterExport: buildRes.sent ? undefined : buildOptions?.afterExport,
                 bundleTotalChats: totalChats,
                 bundleSuccessCount: entries.length,
                 bundleFailedCount: failures.length,
@@ -1797,11 +1887,12 @@ function handleStartBundleExportMessage(msg: any, sendResponse: (res: any) => vo
                 totalChats,
                 successChats: entries.length,
                 failedChats: failures.length,
+                sent: buildRes.sent,
             });
         } catch (e: any) {
             const message = e?.message || String(e);
             broadcastStatus({ tabId, phase: 'error', error: message });
-            sendResponse({ error: message });
+            sendResponse({ error: message, ...ingestErrorFields(e) });
         } finally {
             activeExports.delete(tabId); void persistActiveExports();
         }
